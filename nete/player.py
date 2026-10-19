@@ -22,11 +22,13 @@ heard all of it. What you press is written back to the mix's file and decides wh
 gets played next time.
 """
 
+import array
 import curses
-import os
-import signal
+import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 from . import audio, store
@@ -51,55 +53,100 @@ def segment_at(cues, elapsed):
 
 
 class Session:
-    """One mix playing, with its process, its clock and its ratings."""
+    """One mix playing, with its process, its clock and its ratings.
+
+    Pausing stops the player rather than suspending it. Suspending it looked
+    simpler and survived a short pause, but not a long one: macOS sleeps while
+    you are away, tears the audio device down and builds it again on wake, and a
+    suspended player sleeps through all of that. It comes back alive and silent.
+
+    So a pause remembers the position and kills the player, and a resume writes
+    the rest of the mix to a temporary file and plays that. afplay cannot start
+    partway through a file, which is why resuming needs a trimmed copy. It costs
+    about a second and a half on an hour-long mix.
+    """
 
     def __init__(self, meta):
         self.meta = meta
         self.cues = meta.get("cues", [])
         self.total = meta.get("seconds", 0) or audio.duration(meta["audio"])
-        self.proc = subprocess.Popen(
-            ["afplay", str(meta["audio"])],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.started = time.monotonic()
-        self.paused_at = None
-        self.paused_total = 0.0
+        self.scratch = pathlib.Path(tempfile.mkdtemp(prefix="nete_play_"))
+        self.paused_position = None
         self.stopped_at = None
+        self.proc = None
+        self._start(pathlib.Path(meta["audio"]), at=0.0)
+
+    def _start(self, path, at):
+        self.proc = subprocess.Popen(["afplay", str(path)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Pretend playback began however long ago it would have, so the clock
+        # keeps reading the position in the whole mix rather than in this piece.
+        self.started = time.monotonic() - at
 
     @property
     def elapsed(self):
-        # Frozen once the audio stops, so a mix waiting to be rated does not go
-        # on counting past its own length.
-        now = self.stopped_at or self.paused_at or time.monotonic()
-        return min(now - self.started - self.paused_total, self.total or float("inf"))
+        # Frozen while paused or once the audio stops, so a mix waiting to be
+        # rated does not go on counting past its own length.
+        if self.paused_position is not None:
+            return self.paused_position
+        now = self.stopped_at or time.monotonic()
+        return min(now - self.started, self.total or float("inf"))
 
     @property
     def paused(self):
-        return self.paused_at is not None
+        return self.paused_position is not None
 
     def toggle_pause(self):
-        # afplay has no pause of its own, so the process itself is suspended.
         if self.paused:
-            os.kill(self.proc.pid, signal.SIGCONT)
-            self.paused_total += time.monotonic() - self.paused_at
-            self.paused_at = None
+            self.resume()
         else:
-            os.kill(self.proc.pid, signal.SIGSTOP)
-            self.paused_at = time.monotonic()
+            self.pause()
+
+    def pause(self):
+        self.paused_position = self.elapsed
+        self._kill()
+
+    def resume(self):
+        at = self.paused_position or 0.0
+        self.paused_position = None
+        if at >= self.total - 1:
+            self.stopped_at = time.monotonic()
+            return
+        self._start(self._rest_of_mix(at), at=at)
+
+    def _rest_of_mix(self, at):
+        """Write everything from ``at`` onwards to a file afplay can start on."""
+        for old in self.scratch.glob("*.wav"):
+            old.unlink(missing_ok=True)
+        full = self.scratch / "full.wav"
+        audio.to_wav(self.meta["audio"], full)
+        data, params = audio.read_wav(full)
+        full.unlink()
+        offset = int(at * params.framerate) * params.sampwidth * params.nchannels
+        rest = array.array("h", data.tobytes()[offset:])
+        out = self.scratch / f"from-{int(at)}.wav"
+        audio.write_wav(out, rest, params)
+        return out
+
+    def _kill(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
 
     def finished(self):
-        ended = self.proc.poll() is not None
+        if self.paused:
+            return False
+        ended = self.proc is not None and self.proc.poll() is not None
         if ended and self.stopped_at is None:
             self.stopped_at = time.monotonic()
         return ended
 
     def stop(self):
-        if self.paused:
-            os.kill(self.proc.pid, signal.SIGCONT)
-        self.proc.terminate()
-        try:
-            self.proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
+        self._kill()
+        shutil.rmtree(self.scratch, ignore_errors=True)
 
     def rate_variant(self, score):
         index = segment_at(self.cues, self.elapsed)
@@ -148,10 +195,9 @@ def draw(screen, session, queued, message, ended=False, next_mix=None):
         line_for(-1, "before"),
         line_for(0, "NOW"),
         line_for(1, "next"),
-        f" {'FINISHED' if ended else state} {clock(session.elapsed)} / "
-        f"{clock(session.total)}  [{bar}]  {session.meta['id']}  "
-        f"played {session.meta.get('plays', 0)}x  "
-        f"mix {store.rating_word(session.meta.get('rating'))}  {queued} queued",
+        f" {'FINISHED' if ended else state} {clock(session.elapsed)}/"
+        f"{clock(session.total)} [{bar}] played {session.meta.get('plays', 0)}x "
+        f"mix {store.rating_word(session.meta.get('rating'))} {queued} queued",
         keys,
     ]
     if message and not ended:
@@ -229,8 +275,11 @@ def run(screen, preset, mixes):
                 session.save()
                 return
             if key == " ":
+                if session.paused:
+                    draw(screen, session, len(queue), "resuming...",
+                         next_mix=queue[0]["id"] if queue else None)
                 session.toggle_pause()
-                message = ""
+                message = "" if not session.paused else "paused"
             elif store.normalise_rating(key):
                 score = store.normalise_rating(key)
                 variant = session.rate_variant(score)
@@ -272,6 +321,15 @@ def self_check():
     assert segment_at(cues, 292.0) == 1, "a cue starts exactly on its own timestamp"
     assert segment_at(cues, 10_000) == 2, "past the end stays on the last segment"
     assert segment_at([], 5) == 0, "no cue sheet does not crash"
+
+    # Pausing must not leave the player suspended: a suspended one does not
+    # survive the machine sleeping, which is what a long pause invites. Checking
+    # for the imports rather than the signal names, because a check written as a
+    # string literal finds itself when it reads this file.
+    import importlib
+    module = importlib.import_module(__name__)
+    assert not hasattr(module, "signal"), "the signal module is how suspending was done"
+    assert not hasattr(module, "os"), "os.kill is the other half of it"
     assert clock(0) == "0:00" and clock(65) == "1:05" and clock(-3) == "0:00"
     # The number keys are what the screen offers, so they have to map to scores.
     assert store.normalise_rating("1") == 1 and store.normalise_rating("5") == 5
