@@ -130,12 +130,15 @@ how far through you are, and the keys.
 
 ```
  ▶ NOW     pulse         (4:52)  cyberpunk-pulse-1552719052.flac  [4 good]
- playing 13:36 / 40:12  [########................]  played 0x  mix -  1 queued
- space pause   rate what is playing: 1 bad  2 poor  3 OK  4 good  5 excellent
+ playing 13:36 / 40:12  [########................]  played 0x  mix -  1 queued  vol 0 dB
+ space pause   rate what is playing: 1 bad  2 poor  3 OK  4 good  5 excellent   ↑↓ volume
 ```
 
 The number keys rate whatever is playing at the moment it bothers you. When the
 mix ends the screen holds, and the same keys rate the whole thing.
+
+The up and down arrows (or `+` and `-`) change the volume in 3 dB steps. The
+player restarts to apply it, so expect a second of silence after the last press.
 
 Ratings decide what plays next time: a mix you have never heard comes first,
 then higher rated ones, then whatever you have played least. An unrated mix sits

@@ -34,11 +34,21 @@ import time
 from . import audio, store
 
 BAR_WIDTH = 24
+VOLUME_STEP_DB = 3
+QUIETEST_DB = -30
+# Each volume change restarts the player, which takes about a second, so a run
+# of presses is applied once they stop rather than once per press.
+VOLUME_SETTLE_SECONDS = 0.5
 
 
 def clock(seconds):
     seconds = max(0, int(seconds))
     return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def step_volume(db, steps):
+    """Move ``db`` by ``steps`` presses, between QUIETEST_DB and the mix as made."""
+    return min(0, max(QUIETEST_DB, db + steps * VOLUME_STEP_DB))
 
 
 def segment_at(cues, elapsed):
@@ -64,10 +74,14 @@ class Session:
     the rest of the mix to a temporary file and plays that. afplay cannot start
     partway through a file, which is why resuming needs a trimmed copy. It costs
     about a second and a half on an hour-long mix.
+
+    Volume works the same way. afplay takes it only when it starts, so a change
+    stops the player and starts it again where it was.
     """
 
-    def __init__(self, meta):
+    def __init__(self, meta, volume_db=0):
         self.meta = meta
+        self.volume_db = volume_db
         self.cues = meta.get("cues", [])
         self.total = meta.get("seconds", 0) or audio.duration(meta["audio"])
         self.scratch = pathlib.Path(tempfile.mkdtemp(prefix="nete_play_"))
@@ -77,7 +91,8 @@ class Session:
         self._start(pathlib.Path(meta["audio"]), at=0.0)
 
     def _start(self, path, at):
-        self.proc = subprocess.Popen(["afplay", str(path)],
+        gain = 10 ** (self.volume_db / 20)
+        self.proc = subprocess.Popen(["afplay", "-v", f"{gain:.4f}", str(path)],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Pretend playback began however long ago it would have, so the clock
         # keeps reading the position in the whole mix rather than in this piece.
@@ -113,6 +128,12 @@ class Session:
             self.stopped_at = time.monotonic()
             return
         self._start(self._rest_of_mix(at), at=at)
+
+    def apply_volume(self):
+        """Restart at the current position so the player picks up the volume."""
+        if not self.paused:
+            self.pause()
+            self.resume()
 
     def _rest_of_mix(self, at):
         """Write everything from ``at`` onwards to a file afplay can start on."""
@@ -187,7 +208,7 @@ def draw(screen, session, queued, message, ended=False, next_mix=None):
 
     scale = "1 bad  2 poor  3 OK  4 good  5 excellent"
     keys = (f" PRESS A NUMBER TO RATE IT:  {scale}      n skip   q quit" if ended else
-            f" space pause   rate what is playing: {scale}   n next   q quit")
+            f" space pause   rate what is playing: {scale}   ↑↓ volume   n next   q quit")
     head = ("  THIS MIX HAS FINISHED, WAITING FOR YOUR RATING" if ended
             else f" {session.meta['audio']}")
     rows = [
@@ -197,7 +218,8 @@ def draw(screen, session, queued, message, ended=False, next_mix=None):
         line_for(1, "next"),
         f" {'FINISHED' if ended else state} {clock(session.elapsed)}/"
         f"{clock(session.total)} [{bar}] played {session.meta.get('plays', 0)}x "
-        f"mix {store.rating_word(session.meta.get('rating'))} {queued} queued",
+        f"mix {store.rating_word(session.meta.get('rating'))} {queued} queued "
+        f"vol {session.volume_db} dB",
         keys,
     ]
     if message and not ended:
@@ -233,6 +255,8 @@ def run(screen, preset, mixes):
     queue = list(mixes)
     message = f"{preset['name']}: {len(queue)} mix(es)"
     session = None
+    volume_db = 0
+    volume_changed_at = None
 
     try:
         while True:
@@ -242,7 +266,8 @@ def run(screen, preset, mixes):
                 meta = queue.pop(0)
                 meta["plays"] = meta.get("plays", 0) + 1
                 meta["last_played"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-                session = Session(meta)
+                session = Session(meta, volume_db)
+                volume_changed_at = None
                 session.save()
 
             if session.finished():
@@ -267,6 +292,10 @@ def run(screen, preset, mixes):
             try:
                 key = screen.getkey()
             except curses.error:
+                if (volume_changed_at
+                        and time.monotonic() - volume_changed_at >= VOLUME_SETTLE_SECONDS):
+                    volume_changed_at = None
+                    session.apply_volume()
                 time.sleep(0.25)
                 continue
 
@@ -286,6 +315,11 @@ def run(screen, preset, mixes):
                 session.save()
                 message = (f"{variant} rated {store.rating_word(score)}" if variant
                            else "no cue sheet for this mix")
+            elif key in ("KEY_UP", "KEY_DOWN", "+", "=", "-"):
+                volume_db = step_volume(volume_db, 1 if key in ("KEY_UP", "+", "=") else -1)
+                session.volume_db = volume_db
+                volume_changed_at = time.monotonic()
+                message = f"volume {volume_db} dB"
             elif key == "n":
                 session.stop()
                 session.save()
@@ -321,6 +355,9 @@ def self_check():
     assert segment_at(cues, 292.0) == 1, "a cue starts exactly on its own timestamp"
     assert segment_at(cues, 10_000) == 2, "past the end stays on the last segment"
     assert segment_at([], 5) == 0, "no cue sheet does not crash"
+    assert step_volume(0, 1) == 0, "never louder than the mix as made"
+    assert step_volume(0, -2) == -6
+    assert step_volume(QUIETEST_DB, -1) == QUIETEST_DB
 
     # Pausing must not leave the player suspended: a suspended one does not
     # survive the machine sleeping, which is what a long pause invites. Checking
